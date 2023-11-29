@@ -1,0 +1,136 @@
+# Library Imports
+import os
+import pickle
+import random
+import numpy as np
+import argparse
+import pandas as pd
+import keras
+import torch
+import matplotlib.pyplot as plt
+import h5py
+
+# Functionality Import
+from pathlib import Path
+from sklearn.model_selection import train_test_split
+from nilearn.image import load_img
+from nilearn.masking import unmask
+from scipy.ndimage.interpolation import rotate
+from sklearn.preprocessing import StandardScaler
+from ipywidgets import interactive, IntSlider
+from tabulate import tabulate
+from alive_progress import alive_bar
+
+# ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+# ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+# 1D MUDI Dataset Initialization Class
+class MUDI_fcglVNN(keras.utils.Sequence):
+
+    # Constructor / Initialization Function
+    def __init__(
+        self,
+        settings: argparse.ArgumentParser,
+        subject: int or list
+    ):
+        
+        # Parameter & Patient Index Value Access
+        super(MUDI_fcglVNN).__init__()
+        self.settings = settings
+
+        # Vertical Splitting (Patient Selection)
+        self.idxv = pd.read_csv(self.settings.info_filepath,            # List of Index Values ...
+                                index_col = 0).to_numpy()               # ... pertaining to each Patient
+        self.idxv = self.idxv[np.isin(self.idxv[:, 1], subject), 0]     # Patient-Specific Index Values
+        self.idxv_set = np.arange(len(self.idxv))
+
+        # Horizontal Splitting (Parameter Selection)
+        idxh_train_filepath = Path(f"{self.settings.datasave_folderpath}/1D Training Labels (V{self.settings.data_version}).txt")    # Filepath for Selected Training Labels
+        idxh_val_filepath = Path(f"{self.settings.datasave_folderpath}/1D Validation Labels (V{self.settings.data_version}).txt")    # Filepath for Selected Validation Labels
+        self.idxh_train = np.sort(np.loadtxt(idxh_train_filepath)).astype(int); self.num_train_params = len(self.idxh_train)
+        self.idxh_val = np.sort(np.loadtxt(idxh_val_filepath)).astype(int); self.num_val_params = len(self.idxh_val)
+        assert(self.num_train_params == self.settings.num_train_params), "ERROR: Model wrongly Built!"
+        #self.msk = np.logical_not(np.isin(np.arange(1344), self.idxh_train))
+        
+        # Parameter Value Initialization & Selection
+        self.params = pd.read_excel(self.settings.param_filepath)                                       # List of Dataset's Parameters
+        self.num_labels = self.settings.num_labels
+        if self.settings.gradient_coord:
+            self.params = self.params.drop(columns = ['Gradient theta', 'Gradient phi'])                # Choosing of Gradient Orientation
+        else: self.params = self.params.drop(columns = ['Gradient x', 'Gradient y', 'Gradient z'])      # from 3D Cartesian or Polar Referential
+        assert(self.params.shape[1] == self.num_labels), "ERROR: Labels wrongly Deleted!"
+        if self.settings.label_norm:                                                                    # Control Boolean Value for the Normalization of Labels
+            self.scaler = StandardScaler()
+            self.params = pd.DataFrame( self.scaler.fit_transform(self.params),
+                                        columns = self.params.columns)
+        
+        # Label Normalizer / Scaler Saving
+        scaler_filepath = Path(f"{self.settings.datasave_folderpath}/1D Label Scaler (V{self.settings.data_version}).pkl")
+        if not scaler_filepath.exists(): torch.save(self.scaler, scaler_filepath)
+        
+        # Random Selection of Parameters for Training Loop Reconstruction
+        self.num_train_recon = int((self.settings.param_recon_train * self.num_train_params) / 100)
+        self.num_val_recon = int((self.settings.param_recon_train * self.num_val_params) / 100)
+        self.num_recon = self.num_train_recon + self.num_val_recon
+        self.idxh_recon = np.hstack((   self.idxh_train[np.sort(np.random.choice(self.num_train_params,
+                                                                self.num_train_recon, replace = False))],
+                                        self.idxh_val[np.sort(np.random.choice(self.num_val_params,
+                                                                self.num_val_recon, replace = False))]))
+    
+    # --------------------------------------------------------------------------------------------
+
+    # DataLoader Length / No. Batches Computation Functionality
+    def __len__(self): return int(np.ceil((len(self.idxv) * self.num_recon) / float(self.settings.batch_size)))
+
+    # Single-Batch Generation Functionality
+    def __getitem__(self, idx):
+
+        """ The first 'num_recon' Batches will contain the exact same Training Data 'X_train', but have its 
+            Target Parameter 'y_target' and Target Voxel Intensity GT 'X_target' changed, according to which
+            Parameter the Training Data is being mapped to, allowing for a normal Training Step.            """
+
+        # Batch Vertical/Patient & Horizontal/Parameter Indexing 
+        idxv = self.idxv_set[   (idx // self.num_recon) * self.settings.batch_size :            # Batch's Vertical Index for X_train
+                                ((idx // self.num_recon) + 1) * self.settings.batch_size]
+        idxv = [self.idxv[k] for k in idxv]; idxh = idx % self.num_recon                        # Batch's Horizontal Index for y_target
+        (X_train, y_target), X_target = self.get_data(idxv, idxh)
+        return (X_train, y_target), X_target
+    
+    # Label Scaler Download & Reverse Transformation
+    def label_unscale(
+        self,
+        y: np.array or pd.DataFrame
+    ):
+
+        # Label Scaler Download & Reverse Usage
+        try: self.scaler
+        except AttributeError:
+            scaler = torch.load(f"{self.settings.datasave_folderpath}/1D Label Scaler (V{self.settings.data_version}).pkl")
+        return scaler.inverse_transform(y.reshape(1, -1))
+
+    # --------------------------------------------------------------------------------------------
+
+    # End of Epoch Shuffling Functionality
+    def on_epoch_end(self):
+        
+        # Batch Shuffling
+        self.idxv_set = np.arange(len(self.idxv))
+        if self.settings.sample_shuffle: np.random.shuffle(self.idxv_set)
+
+        # Reconstruction Parameter Shuffling
+        if self.settings.param_shuffle:
+            self.idxh_recon = np.hstack((   self.idxh_train[np.sort(np.random.choice(self.num_train_params,
+                                            int((self.settings.param_recon_train * self.num_train_params) / 100), replace = False))],
+                                            self.idxh_val[np.sort(np.random.choice(self.num_val_params,
+                                            int((self.settings.param_recon_train * self.num_val_params) / 100), replace = False))]))
+
+    # Data Generation Functionality
+    def get_data(self, idxv, idxh):
+
+        # Data Access
+        data = h5py.File(self.settings.data_filepath, 'r').get('data1')
+        X_train = data[idxv, :][:, self.idxh_train]                                             # [batch_size,  num_train_params] Training Data
+        y_target = self.params.iloc[idxh, :].values.reshape((1, self.settings.num_labels))      # [1,           num_labels] Target Parameters
+        y_target = y_target.repeat(self.settings.batch_size, 0)                                 # [batch_size,  num_labels] Target Parameters
+        X_target = data[idxv, :][:, idxh].reshape((self.settings.batch_size, 1))                # [batch_size,  1] GT Target Data
+        return (X_train, y_target), X_target
